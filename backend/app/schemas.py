@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 Role = Literal["system", "user", "assistant"]
 Status = Literal["raw", "prelabelled", "annotated", "accepted", "rework"]
+AnnotationLevel = Literal["instance", "behavior"]
 
 
 class Message(BaseModel):
@@ -22,6 +23,10 @@ class ImportRequest(BaseModel):
 
 class AnnotationJobCreateRequest(BaseModel):
     name: str = "teacher_annotation"
+    folder_path: str = ""
+    annotation_level: AnnotationLevel = "instance"
+    frame_count: int = Field(default=1, ge=1, le=10)
+    copy_assets: bool = True
     batch: str = ""
     status: str = "raw"
     asset_ids: list[int] = Field(default_factory=list)
@@ -80,10 +85,6 @@ class VlmSettings(BaseModel):
     api_key: str = ""
     model: str = ""
     timeout_seconds: int = 60
-    prompt_template: str = (
-        '请基于图片生成一条中文图文问答 SFT 样本，并只返回 JSON：'
-        '{"messages":[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}'
-    )
 
 
 class TrainRequest(BaseModel):

@@ -37,7 +37,6 @@ import {
   Save,
   Search,
   Settings,
-  Upload
 } from 'lucide-react';
 import { api } from './api';
 import type { AnnotationJob, AnnotationJobItem, AnnotationStatus, Asset, Message, PromptScene, SettingsPayload, Validation } from './types';
@@ -46,9 +45,9 @@ const { Header, Content } = Layout;
 const { Text, Title } = Typography;
 
 type ViewKey = 'home' | 'annotation';
-type AnnotationSection = 'jobs' | 'review' | 'import' | 'prompts' | 'settings' | 'export';
+type AnnotationSection = 'jobs' | 'review' | 'prompts' | 'settings' | 'export';
 
-const annotationSections: AnnotationSection[] = ['jobs', 'review', 'import', 'prompts', 'settings', 'export'];
+const annotationSections: AnnotationSection[] = ['jobs', 'review', 'prompts', 'settings', 'export'];
 
 function routeFromHash(): { view: ViewKey; section: AnnotationSection } {
   const raw = window.location.hash.replace(/^#\/?/, '');
@@ -93,12 +92,28 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error?: Error }
 }
 
 const statusOptions: Array<{ label: string; value: AnnotationStatus; color: string }> = [
-  { label: 'raw', value: 'raw', color: 'default' },
-  { label: 'prelabelled', value: 'prelabelled', color: 'processing' },
-  { label: 'annotated', value: 'annotated', color: 'warning' },
-  { label: 'accepted', value: 'accepted', color: 'success' },
-  { label: 'rework', value: 'rework', color: 'error' }
+  { label: '未标注', value: 'raw', color: 'default' },
+  { label: '已预标注', value: 'prelabelled', color: 'processing' },
+  { label: '已修订', value: 'annotated', color: 'warning' },
+  { label: '已入库', value: 'accepted', color: 'success' },
+  { label: '待返修', value: 'rework', color: 'error' }
 ];
+
+const jobItemStatusText: Record<string, string> = {
+  queued: '排队中',
+  running: '标注中',
+  completed: '已完成',
+  failed: '失败'
+};
+
+const jobStatusText: Record<string, string> = {
+  queued: '排队中',
+  running: '运行中',
+  completed: '已完成',
+  completed_with_errors: '部分失败',
+  failed: '失败',
+  cancelled: '已取消'
+};
 
 const emptySettings: SettingsPayload = {
   swift: { swift_bin: 'swift', working_dir: '', default_cuda_visible_devices: '0' },
@@ -106,14 +121,33 @@ const emptySettings: SettingsPayload = {
     endpoint: '',
     api_key: '',
     model: '',
-    timeout_seconds: 60,
-    prompt_template:
-      '请基于图片生成一条中文图文问答 SFT 样本，并只返回 JSON：{"messages":[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}'
+    timeout_seconds: 60
   }
 };
 
 function statusColor(status: string) {
-  return statusOptions.find((item) => item.value === status)?.color ?? (status.includes('fail') ? 'error' : 'default');
+  return statusOptions.find((item) => item.value === status)?.color ?? jobStatusColor(status);
+}
+
+function jobStatusColor(status: string) {
+  if (status === 'completed') return 'success';
+  if (status === 'running') return 'processing';
+  if (status === 'queued') return 'default';
+  if (status === 'completed_with_errors') return 'warning';
+  if (status === 'cancelled') return 'default';
+  return status.includes('fail') ? 'error' : 'default';
+}
+
+function annotationStatusText(status: string) {
+  return statusOptions.find((item) => item.value === status)?.label ?? status;
+}
+
+function jobItemStatusLabel(status: string) {
+  return jobItemStatusText[status] ?? status;
+}
+
+function jobStatusLabel(status: string) {
+  return jobStatusText[status] ?? status;
 }
 
 function progressOf(job: AnnotationJob) {
@@ -164,7 +198,6 @@ function AnnotationNav({ section, onChange }: { section: AnnotationSection; onCh
   const items: Array<{ key: AnnotationSection; label: string; icon: ReactNode }> = [
     { key: 'jobs', label: '标注任务', icon: <Bot size={16} /> },
     { key: 'review', label: '人工审核', icon: <Edit3 size={16} /> },
-    { key: 'import', label: '素材导入', icon: <Upload size={16} /> },
     { key: 'prompts', label: '提示词库', icon: <BookOpenText size={16} /> },
     { key: 'settings', label: 'Teacher', icon: <Settings size={16} /> },
     { key: 'export', label: '导出 JSON', icon: <FileJson size={16} /> }
@@ -198,63 +231,9 @@ function AnnotationCenter({
       <div className="annotation-content">
         {section === 'jobs' && <JobCenter onReviewJob={onReviewJob} />}
         {section === 'review' && <ReviewView />}
-        {section === 'import' && <ImportView />}
         {section === 'prompts' && <PromptLibraryView />}
         {section === 'settings' && <SettingsView />}
         {section === 'export' && <ExportView onReviewJob={onReviewJob} />}
-      </div>
-    </div>
-  );
-}
-
-function ImportView() {
-  const { message, modal } = AntApp.useApp();
-  const [form] = Form.useForm();
-  const [loading, setLoading] = useState(false);
-  const [batches, setBatches] = useState<string[]>([]);
-
-  async function refreshBatches() {
-    const response = await api.listAssets();
-    setBatches(Array.isArray(response.batches) ? response.batches : []);
-  }
-
-  useEffect(() => {
-    void refreshBatches();
-  }, []);
-
-  async function submit(values: { folder_path: string; batch: string; copy_assets?: boolean }) {
-    setLoading(true);
-    try {
-      const result = await api.importAssets({ folder_path: values.folder_path, batch: values.batch || 'default', copy_assets: values.copy_assets ?? true });
-      message.success(`导入 ${result.imported} 条，重复 ${result.duplicates} 条`);
-      if (result.failed.length) {
-        modal.warning({ title: '导入异常', content: result.failed.slice(0, 8).map((item) => `${item.path}: ${item.reason}`).join('\n') });
-      }
-      await refreshBatches();
-    } catch (error) {
-      message.error((error as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <div className="single-panel">
-      <Title level={4}>素材导入</Title>
-      <Form form={form} layout="vertical" initialValues={{ batch: 'default', copy_assets: true }} onFinish={submit}>
-        <Form.Item name="folder_path" label="图片文件夹" rules={[{ required: true, message: '请输入文件夹路径' }]}>
-          <Input placeholder="D:\\data\\images" />
-        </Form.Item>
-        <Form.Item name="batch" label="批次名">
-          <Input placeholder="例如：产品图_第一批" />
-        </Form.Item>
-        <Form.Item name="copy_assets" valuePropName="checked">
-          <Checkbox>复制到工作区</Checkbox>
-        </Form.Item>
-        <Button type="primary" htmlType="submit" loading={loading} icon={<Upload size={16} />}>开始导入</Button>
-      </Form>
-      <div className="batch-strip">
-        {batches.map((batch) => <Tag key={batch}>{batch}</Tag>)}
       </div>
     </div>
   );
@@ -290,9 +269,6 @@ function SettingsView() {
         </Form.Item>
         <Form.Item name="timeout_seconds" label="超时">
           <InputNumber min={1} max={600} />
-        </Form.Item>
-        <Form.Item name="prompt_template" label="默认提示词">
-          <Input.TextArea rows={6} />
         </Form.Item>
         <Button type="primary" htmlType="submit" icon={<Save size={16} />}>保存</Button>
       </Form>
@@ -416,15 +392,14 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
   const { message } = AntApp.useApp();
   const [form] = Form.useForm();
   const [jobs, setJobs] = useState<AnnotationJob[]>([]);
-  const [batches, setBatches] = useState<string[]>([]);
   const [scenes, setScenes] = useState<PromptScene[]>([]);
   const [selectedSceneId, setSelectedSceneId] = useState<number>();
   const [loading, setLoading] = useState(false);
+  const annotationLevel = Form.useWatch('annotation_level', form) ?? 'instance';
 
   async function refresh() {
-    const [jobsResponse, assetsResponse, scenesResponse] = await Promise.all([api.listAnnotationJobs(), api.listAssets(), api.listPromptScenes()]);
+    const [jobsResponse, scenesResponse] = await Promise.all([api.listAnnotationJobs(), api.listPromptScenes()]);
     setJobs(Array.isArray(jobsResponse.items) ? jobsResponse.items : []);
-    setBatches(Array.isArray(assetsResponse.batches) ? assetsResponse.batches : []);
     setScenes(Array.isArray(scenesResponse.items) ? scenesResponse.items : []);
   }
 
@@ -438,10 +413,11 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
 
   async function create(values: {
     name: string;
-    batch?: string;
-    status: string;
+    folder_path: string;
+    annotation_level: 'instance' | 'behavior';
+    frame_count?: number;
+    copy_assets?: boolean;
     concurrency: number;
-    overwrite_existing?: boolean;
     prompt_scene_id?: number;
     prompt_version_id?: number;
     custom_prompt?: string;
@@ -450,10 +426,12 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
     try {
       const job = await api.createAnnotationJob({
         name: values.name,
-        batch: values.batch,
-        status: values.status,
+        folder_path: values.folder_path,
+        annotation_level: values.annotation_level,
+        frame_count: values.annotation_level === 'behavior' ? values.frame_count ?? 5 : 1,
+        copy_assets: values.copy_assets ?? true,
         concurrency: values.concurrency,
-        overwrite_existing: values.overwrite_existing ?? false,
+        overwrite_existing: false,
         prompt_scene_id: values.prompt_scene_id,
         prompt_version_id: values.prompt_version_id,
         custom_prompt: values.custom_prompt ?? ''
@@ -471,8 +449,8 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
 
   async function exportJob(job: AnnotationJob, acceptedOnly: boolean) {
     try {
-      const result = await api.exportAnnotationJob(job.id, { accepted_only: acceptedOnly });
-      message.success(`已导出 ${result.count} 条：${result.jsonl_path}`);
+      const result = await api.downloadAnnotationJob(job.id, { accepted_only: acceptedOnly });
+      message.success(`已开始下载：${result.filename}`);
       await refresh();
     } catch (error) {
       message.error((error as Error).message);
@@ -486,34 +464,44 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
         <Form
           form={form}
           layout="vertical"
-          initialValues={{ name: `teacher_${new Date().toISOString().slice(0, 10)}`, status: 'raw', concurrency: 3, overwrite_existing: false }}
+          initialValues={{
+            name: `drive_${new Date().toISOString().slice(0, 10)}`,
+            annotation_level: 'instance',
+            frame_count: 5,
+            concurrency: 3,
+            copy_assets: true
+          }}
           onFinish={create}
         >
           <Form.Item name="name" label="任务名" rules={[{ required: true }]}>
             <Input />
           </Form.Item>
-          <Form.Item name="batch" label="素材批次">
-            <Select allowClear placeholder="全部批次" options={batches.map((batch) => ({ label: batch, value: batch }))} />
+          <Form.Item name="folder_path" label="本地图片目录" rules={[{ required: true, message: '请输入本地图片目录' }]}>
+            <Input placeholder="D:\\datasets\\driving_frames\\scene_001" />
           </Form.Item>
-          <Form.Item name="status" label="素材状态">
+          <Form.Item name="annotation_level" label="标注等级">
             <Select
               options={[
-                { label: 'raw', value: 'raw' },
-                { label: 'rework', value: 'rework' },
-                { label: 'all', value: 'all' }
+                { label: '实例级', value: 'instance' },
+                { label: '行为级', value: 'behavior' }
               ]}
             />
           </Form.Item>
+          {annotationLevel === 'behavior' && (
+            <Form.Item name="frame_count" label="每条行为样本帧数">
+              <InputNumber min={1} max={10} />
+            </Form.Item>
+          )}
           <Form.Item name="concurrency" label="并发数">
             <InputNumber min={1} max={16} />
           </Form.Item>
           <Form.Item name="prompt_scene_id" label="提示词场景">
             <Select
               allowClear
-              placeholder="使用全局默认"
+              placeholder="可选：选择已保存场景"
               options={scenes.map((scene) => ({ label: scene.name, value: scene.id }))}
               onChange={(value) => {
-                setSelectedSceneId(value);
+                setSelectedSceneId(value as number | undefined);
                 form.setFieldValue('prompt_version_id', undefined);
               }}
             />
@@ -526,11 +514,31 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
               options={(selectedScene?.versions ?? []).map((version) => ({ label: version.version, value: version.id }))}
             />
           </Form.Item>
-          <Form.Item name="custom_prompt" label="临时提示词">
-            <Input.TextArea rows={5} />
+          <Form.Item shouldUpdate noStyle>
+            {({ getFieldValue }) => (
+              <Form.Item
+                name="custom_prompt"
+                label="任务提示词"
+                rules={[
+                  {
+                    validator: (_, value) => {
+                      if (String(value ?? '').trim() || getFieldValue('prompt_version_id') || getFieldValue('prompt_scene_id')) {
+                        return Promise.resolve();
+                      }
+                      return Promise.reject(new Error('请输入本次任务提示词，或选择提示词场景/版本'));
+                    }
+                  }
+                ]}
+              >
+                <Input.TextArea
+                  rows={6}
+                  placeholder="请输入本次标注任务的场景提示词，例如：基于道路连续帧判断前车是否存在变道意图，并给出可见依据。"
+                />
+              </Form.Item>
+            )}
           </Form.Item>
-          <Form.Item name="overwrite_existing" valuePropName="checked">
-            <Checkbox>覆盖已有标注</Checkbox>
+          <Form.Item name="copy_assets" valuePropName="checked">
+            <Checkbox>复制图片到工作区</Checkbox>
           </Form.Item>
           <Button type="primary" htmlType="submit" loading={loading} icon={<Play size={16} />}>启动标注</Button>
         </Form>
@@ -545,14 +553,28 @@ function JobCenter({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
           size="small"
           dataSource={jobs}
           pagination={{ pageSize: 8 }}
-          scroll={{ x: 900 }}
+          scroll={{ x: 1120 }}
           columns={[
             { title: '任务', dataIndex: 'name', ellipsis: true },
             { title: '状态', dataIndex: 'status', width: 140, render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag> },
             {
+              title: '等级',
+              width: 100,
+              render: (_: unknown, job: AnnotationJob) => (
+                <Tag color={job.config?.annotation_level === 'behavior' ? 'purple' : 'blue'}>
+                  {job.config?.annotation_level === 'behavior' ? '行为级' : '实例级'}
+                </Tag>
+              )
+            },
+            {
+              title: '来源目录',
+              width: 220,
+              render: (_: unknown, job: AnnotationJob) => <Text ellipsis>{String(job.source?.folder_path ?? '')}</Text>
+            },
+            {
               title: '提示词',
               width: 180,
-              render: (_: unknown, job: AnnotationJob) => <Text ellipsis>{String(job.config?.prompt_label ?? '全局默认')}</Text>
+              render: (_: unknown, job: AnnotationJob) => <Text ellipsis>{String(job.config?.prompt_label ?? '任务提示词')}</Text>
             },
             {
               title: '进度',
@@ -597,8 +619,8 @@ function ExportView({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
 
   async function exportJob(job: AnnotationJob, acceptedOnly: boolean) {
     try {
-      const result = await api.exportAnnotationJob(job.id, { accepted_only: acceptedOnly });
-      message.success(`已导出 ${result.count} 条：${result.jsonl_path}`);
+      const result = await api.downloadAnnotationJob(job.id, { accepted_only: acceptedOnly });
+      message.success(`已开始下载：${result.filename}`);
       await refresh();
     } catch (error) {
       message.error((error as Error).message);
@@ -616,11 +638,25 @@ function ExportView({ onReviewJob }: { onReviewJob: (jobId: string) => void }) {
         size="small"
         dataSource={jobs}
         pagination={{ pageSize: 10 }}
-        scroll={{ x: 900 }}
+        scroll={{ x: 1120 }}
         columns={[
           { title: '任务', dataIndex: 'name', ellipsis: true },
           { title: '状态', dataIndex: 'status', width: 160, render: (value: string) => <Tag color={statusColor(value)}>{value}</Tag> },
+          {
+            title: '等级',
+            width: 100,
+            render: (_: unknown, job: AnnotationJob) => (
+              <Tag color={job.config?.annotation_level === 'behavior' ? 'purple' : 'blue'}>
+                {job.config?.annotation_level === 'behavior' ? '行为级' : '实例级'}
+              </Tag>
+            )
+          },
           { title: '已完成', width: 100, render: (_: unknown, job: AnnotationJob) => `${job.completed_count}/${job.total_count}` },
+          {
+            title: '来源目录',
+            width: 220,
+            render: (_: unknown, job: AnnotationJob) => <Text ellipsis>{String(job.source?.folder_path ?? '')}</Text>
+          },
           { title: '导出路径', dataIndex: 'export_path', ellipsis: true },
           {
             title: '操作',
@@ -761,6 +797,12 @@ function ReviewView({ jobId }: { jobId?: string }) {
     job?.items?.forEach((item) => map.set(item.asset_id, item));
     return map;
   }, [job]);
+  const selectedItem = selected ? itemsByAsset.get(selected.id) : undefined;
+  const selectedFrames = selectedItem?.sample?.frames?.length
+    ? selectedItem.sample.frames
+    : selected
+      ? [{ index: 1, asset_id: selected.id, file_name: selected.file_name, original_path: selected.original_path, stored_path: selected.stored_path, width: selected.width, height: selected.height, sha256: selected.sha256 }]
+      : [];
 
   return (
     <div className="workspace-grid">
@@ -768,7 +810,7 @@ function ReviewView({ jobId }: { jobId?: string }) {
         {job ? (
           <div className="job-summary">
             <Text strong>{job.name}</Text>
-            <Tag color={statusColor(job.status)}>{job.status}</Tag>
+            <Tag color={statusColor(job.status)}>{jobStatusLabel(job.status)}</Tag>
             <Progress percent={progressOf(job)} size="small" />
           </div>
         ) : (
@@ -793,8 +835,9 @@ function ReviewView({ jobId }: { jobId?: string }) {
                     <span className="asset-meta">{asset.width}x{asset.height} · {asset.batch}</span>
                   </span>
                   <Space direction="vertical" size={2}>
-                    <Tag color={statusColor(asset.annotation.status)}>{asset.annotation.status}</Tag>
-                    {item && <Tag color={statusColor(item.status)}>{item.status}</Tag>}
+                    <Tag color={statusColor(asset.annotation.status)}>{annotationStatusText(asset.annotation.status)}</Tag>
+                    {item && <Tag color={statusColor(item.status)}>{jobItemStatusLabel(item.status)}</Tag>}
+                    {item?.sample?.annotation_level === 'behavior' && <Tag color="purple">{item.sample.frame_count ?? item.sample.frames?.length ?? 1} 帧</Tag>}
                   </Space>
                 </button>
               );
@@ -810,14 +853,26 @@ function ReviewView({ jobId }: { jobId?: string }) {
               <Space>
                 <Tag color={selected.duplicate_of ? 'orange' : 'blue'}>{selected.id}</Tag>
                 <Text strong>{selected.file_name}</Text>
+                {selectedItem?.sample?.annotation_level === 'behavior' && <Tag color="purple">行为级</Tag>}
               </Space>
               <Space>
                 <Statistic value={`${selected.width}x${selected.height}`} title="尺寸" />
-                <Tag color={statusColor(selected.annotation.status)}>{selected.annotation.status}</Tag>
+                <Tag color={statusColor(selected.annotation.status)}>{annotationStatusText(selected.annotation.status)}</Tag>
               </Space>
             </div>
             <div className="image-stage">
-              <Image src={api.imageUrl(selected)} alt={selected.file_name} preview />
+              {selectedFrames.length > 1 ? (
+                <div className="frame-grid">
+                  {selectedFrames.map((frame) => (
+                    <div className="frame-card" key={`${frame.asset_id}-${frame.index}`}>
+                      <Image src={api.assetImageUrl(frame.asset_id)} alt={frame.file_name} preview />
+                      <span>#{frame.index} {frame.file_name}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Image src={api.imageUrl(selected)} alt={selected.file_name} preview />
+              )}
             </div>
           </>
         ) : (

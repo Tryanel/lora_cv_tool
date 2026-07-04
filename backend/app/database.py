@@ -45,3 +45,11 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def ensure_schema_compat() -> None:
+    """Keep local SQLite data compatible across small v1 schema changes."""
+    with engine.begin() as connection:
+        columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(annotation_job_items)").all()}
+        if "sample_json" not in columns:
+            connection.exec_driver_sql("ALTER TABLE annotation_job_items ADD COLUMN sample_json TEXT DEFAULT '{}'")

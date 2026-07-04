@@ -42,6 +42,26 @@ export interface Validation {
   warnings: string[];
 }
 
+export interface AnnotationSampleFrame {
+  index: number;
+  asset_id: number;
+  file_name: string;
+  original_path: string;
+  stored_path: string;
+  width: number;
+  height: number;
+  sha256: string;
+}
+
+export interface AnnotationSample {
+  sample_id?: string;
+  annotation_level?: 'instance' | 'behavior';
+  frame_count?: number;
+  source_dir?: string;
+  primary_asset_id?: number;
+  frames?: AnnotationSampleFrame[];
+}
+
 export interface AnnotationJobItem {
   id: number;
   job_id: string;
@@ -49,6 +69,7 @@ export interface AnnotationJobItem {
   status: 'queued' | 'running' | 'completed' | 'failed';
   provider: string;
   error: string;
+  sample: AnnotationSample;
   updated_at: string;
   asset: Asset;
 }
@@ -128,6 +149,5 @@ export interface SettingsPayload {
     api_key: string;
     model: string;
     timeout_seconds: number;
-    prompt_template: string;
   };
 }

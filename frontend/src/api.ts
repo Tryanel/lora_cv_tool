@@ -38,9 +38,51 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.text() as Promise<T>;
 }
 
+function filenameFromDisposition(disposition: string | null, fallback: string) {
+  if (!disposition) return fallback;
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const asciiMatch = disposition.match(/filename="?([^"]+)"?/i);
+  return asciiMatch?.[1] ?? fallback;
+}
+
+async function downloadFile(path: string, fallbackName: string) {
+  const response = await fetch(`${API_BASE}${path}`);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      const body = await response.json();
+      detail = typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail ?? body);
+    } catch {
+      detail = await response.text();
+    }
+    throw new Error(detail || '下载失败');
+  }
+  const blob = await response.blob();
+  const filename = filenameFromDisposition(response.headers.get('content-disposition'), fallbackName);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return { filename };
+}
+
 export const api = {
   imageUrl(asset: Asset) {
     return `${API_BASE}${asset.image_url}`;
+  },
+  assetImageUrl(assetId: number) {
+    return `${API_BASE}/assets/${assetId}/image`;
   },
   listAssets(params: { status?: AnnotationStatus; batch?: string; q?: string } = {}) {
     const query = new URLSearchParams();
@@ -48,12 +90,6 @@ export const api = {
       if (value) query.set(key, value);
     });
     return request<{ items: Asset[]; counts: Record<AnnotationStatus, number>; batches: string[] }>(`/assets?${query.toString()}`);
-  },
-  importAssets(payload: { folder_path: string; batch: string; copy_assets: boolean }) {
-    return request<{ imported: number; duplicates: number; failed: Array<{ path: string; reason: string }>; scanned: number }>(
-      '/assets/import',
-      { method: 'POST', body: JSON.stringify(payload) }
-    );
   },
   getAnnotation(assetId: number) {
     return request<{ asset: Asset; validation: Validation }>(`/annotations/${assetId}`);
@@ -87,6 +123,10 @@ export const api = {
   },
   createAnnotationJob(payload: {
     name: string;
+    folder_path?: string;
+    annotation_level?: 'instance' | 'behavior';
+    frame_count?: number;
+    copy_assets?: boolean;
     batch?: string;
     status?: string;
     asset_ids?: number[];
@@ -109,6 +149,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload)
     });
+  },
+  downloadAnnotationJob(jobId: string, payload: { accepted_only: boolean }) {
+    const query = new URLSearchParams({ accepted_only: String(payload.accepted_only) });
+    return downloadFile(`/annotation-jobs/${jobId}/export/download?${query.toString()}`, `annotation_${jobId.slice(0, 8)}.json`);
   },
   exportDataset(payload: { name: string; val_ratio: number; seed: number }) {
     return request<DatasetVersion>('/datasets/export', { method: 'POST', body: JSON.stringify(payload) });

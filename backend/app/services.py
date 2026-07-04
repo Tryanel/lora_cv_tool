@@ -4,6 +4,7 @@ import random
 import shutil
 import threading
 import uuid
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +37,16 @@ from .utils import (
     sha256_file,
     validate_image,
 )
+
+TEACHER_OUTPUT_FORMAT_PROMPT = """
+硬性输出格式要求：
+1. 只能返回一个可被 json.loads 解析的 JSON 对象，禁止 Markdown、代码块、解释文字或额外字段。
+2. JSON 对象必须且只能包含 messages 字段。
+3. messages 必须是数组，且只能包含两类 role：user 和 assistant，禁止输出 system role。
+4. messages 至少包含一条 user 和一条 assistant。
+5. 格式示例：
+{"messages":[{"role":"user","content":"用户问题或任务指令"},{"role":"assistant","content":"模型应学习的回答"}]}
+""".strip()
 
 
 def asset_payload(asset: Asset, annotation: Annotation | None = None) -> dict[str, Any]:
@@ -82,6 +93,7 @@ def annotation_job_item_payload(item: AnnotationJobItem) -> dict[str, Any]:
         "status": item.status,
         "provider": item.provider,
         "error": item.error,
+        "sample": json_loads(item.sample_json, {}),
         "updated_at": item.updated_at.isoformat(),
         "asset": asset_payload(item.asset) if item.asset else None,
     }
@@ -183,47 +195,55 @@ def put_setting(db: Session, key: str, value: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def import_folder(db: Session, folder_path: str, batch: str, copy_assets: bool) -> dict[str, Any]:
+def _scan_image_files(folder_path: str) -> list[Path]:
     folder = Path(folder_path).expanduser().resolve()
     if not folder.exists() or not folder.is_dir():
         raise HTTPException(status_code=400, detail="导入路径不存在或不是文件夹")
+    return sorted((path for path in folder.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS), key=lambda path: path.as_posix())
 
+
+def _create_asset_from_source(db: Session, source: Path, batch: str, copy_assets: bool, provenance: dict[str, Any] | None = None) -> Asset:
+    ok, reason = validate_image(source)
+    if not ok:
+        raise ValueError(reason)
+
+    digest = sha256_file(source)
+    existing = db.scalar(select(Asset).where(Asset.sha256 == digest))
+    meta = image_info(source)
+    phash = perceptual_hash(source)
+    stored = safe_copy_asset(source, ASSET_DIR, digest) if copy_assets else source
+
+    asset = Asset(
+        file_name=source.name,
+        original_path=str(source),
+        stored_path=str(stored),
+        mime_type=meta["mime_type"],
+        sha256=digest,
+        perceptual_hash=phash,
+        width=meta["width"],
+        height=meta["height"],
+        size_bytes=meta["size_bytes"],
+        batch=batch or "default",
+        duplicate_of=existing.id if existing else None,
+    )
+    db.add(asset)
+    db.flush()
+    annotation_provenance = {"exif": meta["exif"], **(provenance or {})}
+    db.add(Annotation(asset_id=asset.id, status="raw", provenance_json=json_dumps(annotation_provenance)))
+    return asset
+
+
+def import_folder(db: Session, folder_path: str, batch: str, copy_assets: bool) -> dict[str, Any]:
     imported = 0
     duplicates = 0
     failed: list[dict[str, str]] = []
-    files = [path for path in folder.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS]
+    files = _scan_image_files(folder_path)
 
     for source in files:
         try:
-            ok, reason = validate_image(source)
-            if not ok:
-                failed.append({"path": str(source), "reason": reason})
-                continue
-
-            digest = sha256_file(source)
-            existing = db.scalar(select(Asset).where(Asset.sha256 == digest))
-            meta = image_info(source)
-            phash = perceptual_hash(source)
-            stored = safe_copy_asset(source, ASSET_DIR, digest) if copy_assets else source
-
-            asset = Asset(
-                file_name=source.name,
-                original_path=str(source),
-                stored_path=str(stored),
-                mime_type=meta["mime_type"],
-                sha256=digest,
-                perceptual_hash=phash,
-                width=meta["width"],
-                height=meta["height"],
-                size_bytes=meta["size_bytes"],
-                batch=batch or "default",
-                duplicate_of=existing.id if existing else None,
-            )
-            db.add(asset)
-            db.flush()
-            db.add(Annotation(asset_id=asset.id, status="raw", provenance_json=json_dumps({"exif": meta["exif"]})))
+            asset = _create_asset_from_source(db, source, batch, copy_assets)
             imported += 1
-            if existing:
+            if asset.duplicate_of:
                 duplicates += 1
         except Exception as exc:
             failed.append({"path": str(source), "reason": str(exc)})
@@ -269,13 +289,23 @@ def _teacher_endpoint(endpoint: str) -> str:
     return cleaned + "/chat/completions"
 
 
-def _fallback_messages(asset: Asset) -> list[dict[str, str]]:
+def _fallback_messages(asset: Asset, sample: dict[str, Any] | None = None) -> list[dict[str, str]]:
+    sample = sample or {}
+    level = sample.get("annotation_level", "instance")
+    frame_count = int(sample.get("frame_count", 1) or 1)
+    if level == "behavior":
+        return [
+            {"role": "user", "content": "请基于连续道路驾驶帧，推理交通参与者、车道/信号、车辆行为与潜在风险，生成一条适合 SFT 训练的问答样本。"},
+            {
+                "role": "assistant",
+                "content": f"该样本包含 {frame_count} 帧连续道路图像，请人工补充车辆/行人/车道线/信号灯变化、主车或目标车行为、风险判断与推理依据。",
+            },
+        ]
     return [
-        {"role": "system", "content": "你是一个严谨的图文问答标注助手。"},
-        {"role": "user", "content": "请观察图片，生成一条适合图文 SFT 训练的问答样本。"},
+        {"role": "user", "content": "请观察道路驾驶图片，围绕交通参与者、车道、信号灯、可行驶区域、目标实例属性或风险点生成一条适合 SFT 训练的问答样本。"},
         {
             "role": "assistant",
-            "content": f"这张图片尺寸为 {asset.width}x{asset.height}，请人工补充主体、场景、属性与可见细节。",
+            "content": f"这张道路图像尺寸为 {asset.width}x{asset.height}，请人工补充实例主体、位置关系、可见属性、交通语义与判断依据。",
         },
     ]
 
@@ -300,7 +330,6 @@ def _coerce_teacher_messages(text: str) -> list[dict[str, str]]:
         messages = data["messages"]
     elif isinstance(data, dict) and {"user", "assistant"} <= data.keys():
         messages = [
-            {"role": "system", "content": data.get("system", "你是一个严谨的图文问答助手。")},
             {"role": "user", "content": str(data["user"])},
             {"role": "assistant", "content": str(data["assistant"])},
         ]
@@ -308,29 +337,57 @@ def _coerce_teacher_messages(text: str) -> list[dict[str, str]]:
     normalized = [
         {"role": str(item.get("role", "")).strip(), "content": str(item.get("content", "")).strip()}
         for item in messages
-        if isinstance(item, dict)
+        if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
     ]
-    if normalized and all(item["role"] in {"system", "user", "assistant"} for item in normalized):
+    roles = {item["role"] for item in normalized}
+    if normalized and {"user", "assistant"} <= roles:
         return normalized
     return [
-        {"role": "system", "content": "你是一个严谨的图文问答助手。"},
         {"role": "user", "content": "请基于图片回答问题，并优先描述可见事实。"},
         {"role": "assistant", "content": text.strip()},
     ]
 
 
-def label_asset_with_teacher(settings: VlmSettings, asset: Asset) -> dict[str, Any]:
-    if not settings.endpoint or not settings.model:
-        return {"messages": _fallback_messages(asset), "provider": "template", "raw": None}
-
-    prompt = settings.prompt_template or (
-        '请基于图片生成一条中文图文问答 SFT 样本，并返回 JSON：'
-        '{"messages":[{"role":"system","content":"..."},{"role":"user","content":"..."},{"role":"assistant","content":"..."}]}'
-    )
-    content = [
-        {"type": "text", "text": prompt},
-        {"type": "image_url", "image_url": {"url": image_to_data_url(Path(asset.stored_path))}},
+def _sample_image_paths(asset: Asset, sample: dict[str, Any] | None = None) -> list[Path]:
+    frames = (sample or {}).get("frames", [])
+    paths = [
+        Path(str(frame.get("stored_path", "")))
+        for frame in frames
+        if isinstance(frame, dict) and frame.get("stored_path")
     ]
+    return paths or [Path(asset.stored_path)]
+
+
+def _augment_prompt_for_driving(prompt: str, sample: dict[str, Any] | None = None) -> str:
+    sample = sample or {}
+    level = sample.get("annotation_level", "instance")
+    if level == "behavior":
+        return (
+            f"{prompt}\n\n"
+            "当前任务是智能驾驶行为级标注。请综合 1~10 帧连续道路驾驶图片进行推理，"
+            "重点关注主车/目标车/行人/骑行者行为、车道线、交通信号、可行驶区域、时序变化、潜在风险和判断依据。"
+            f"\n\n{TEACHER_OUTPUT_FORMAT_PROMPT}"
+        )
+    return (
+        f"{prompt}\n\n"
+        "当前任务是智能驾驶实例级标注。请围绕单帧道路图像中的车辆、行人、骑行者、车道线、交通标志/信号灯、"
+        f"可行驶区域或关键目标实例生成高质量问答。\n\n{TEACHER_OUTPUT_FORMAT_PROMPT}"
+    )
+
+
+def label_asset_with_teacher(settings: VlmSettings, asset: Asset, sample: dict[str, Any] | None = None, task_prompt: str = "") -> dict[str, Any]:
+    if not settings.endpoint or not settings.model:
+        return {"messages": _fallback_messages(asset, sample), "provider": "template", "raw": None}
+
+    prompt = task_prompt.strip()
+    if not prompt:
+        raise ValueError("标注任务缺少场景提示词")
+    content = [{"type": "text", "text": _augment_prompt_for_driving(prompt, sample)}]
+    image_paths = _sample_image_paths(asset, sample)
+    for index, image_path in enumerate(image_paths, start=1):
+        if len(image_paths) > 1:
+            content.append({"type": "text", "text": f"frame_{index}"})
+        content.append({"type": "image_url", "image_url": {"url": image_to_data_url(image_path)}})
     headers = {"Content-Type": "application/json"}
     if settings.api_key:
         headers["Authorization"] = f"Bearer {settings.api_key}"
@@ -383,14 +440,16 @@ def _process_job_item(item_id: int, settings_data: dict[str, Any]) -> None:
         db.commit()
 
         asset = item.asset
+        sample = json_loads(item.sample_json, {})
         settings = VlmSettings(**settings_data)
+        task_prompt = str(settings_data.get("task_prompt", ""))
         try:
-            suggestion = label_asset_with_teacher(settings, asset)
+            suggestion = label_asset_with_teacher(settings, asset, sample, task_prompt=task_prompt)
             annotation = asset.annotation
             annotation.messages_json = json_dumps(suggestion["messages"])
             annotation.status = "prelabelled"
             provenance = json_loads(annotation.provenance_json, {})
-            provenance.update({"teacher_provider": suggestion["provider"], "annotation_job_id": item.job_id, "raw": suggestion["raw"]})
+            provenance.update({"teacher_provider": suggestion["provider"], "annotation_job_id": item.job_id, "sample": sample, "raw": suggestion["raw"]})
             annotation.provenance_json = json_dumps(provenance)
             item.status = "completed"
             item.provider = suggestion["provider"]
@@ -411,8 +470,7 @@ def _run_annotation_job(job_id: str) -> None:
         job.started_at = datetime.utcnow()
         settings_data = get_setting(db, "vlm", VlmSettings().model_dump())
         config = json_loads(job.config_json, {})
-        if config.get("prompt_template"):
-            settings_data["prompt_template"] = config["prompt_template"]
+        settings_data["task_prompt"] = config.get("prompt_template", "")
         item_ids = [row[0] for row in db.execute(select(AnnotationJobItem.id).where(AnnotationJobItem.job_id == job_id)).all()]
         db.commit()
 
@@ -436,42 +494,120 @@ def _run_annotation_job(job_id: str) -> None:
             db.commit()
 
 
-def create_annotation_job(db: Session, request: AnnotationJobCreateRequest) -> dict[str, Any]:
-    statement = select(Asset).join(Annotation).order_by(Asset.created_at)
-    if request.asset_ids:
-        statement = statement.where(Asset.id.in_(request.asset_ids))
-    else:
-        if request.batch:
-            statement = statement.where(Asset.batch == request.batch)
-        if request.status and request.status != "all":
-            statement = statement.where(Annotation.status == request.status)
-        if not request.overwrite_existing:
-            statement = statement.where(Annotation.status.in_(["raw", "rework"]))
+def _frame_payload(asset: Asset, index: int) -> dict[str, Any]:
+    return {
+        "index": index,
+        "asset_id": asset.id,
+        "file_name": asset.file_name,
+        "original_path": asset.original_path,
+        "stored_path": asset.stored_path,
+        "width": asset.width,
+        "height": asset.height,
+        "sha256": asset.sha256,
+    }
 
-    assets = db.scalars(statement).all()
+
+def _sample_from_assets(assets: list[Asset], annotation_level: str, source_dir: str, sample_index: int) -> dict[str, Any]:
+    return {
+        "sample_id": f"{annotation_level}_{sample_index:06d}",
+        "annotation_level": annotation_level,
+        "frame_count": len(assets),
+        "source_dir": source_dir,
+        "primary_asset_id": assets[0].id,
+        "frames": [_frame_payload(asset, index) for index, asset in enumerate(assets, start=1)],
+    }
+
+
+def _build_job_samples(assets: list[Asset], annotation_level: str, frame_count: int, source_dir: str) -> list[dict[str, Any]]:
+    if annotation_level == "behavior":
+        group_size = max(1, min(frame_count, 10))
+        groups = [assets[index:index + group_size] for index in range(0, len(assets), group_size)]
+        return [_sample_from_assets(group, annotation_level, source_dir, index) for index, group in enumerate(groups, start=1) if group]
+    return [_sample_from_assets([asset], "instance", source_dir, index) for index, asset in enumerate(assets, start=1)]
+
+
+def _create_assets_for_job(db: Session, request: AnnotationJobCreateRequest) -> tuple[list[Asset], list[dict[str, str]]]:
+    failed: list[dict[str, str]] = []
+    files = _scan_image_files(request.folder_path)
+    if not files:
+        raise HTTPException(status_code=400, detail="目录中没有可标注的图片")
+
+    batch = request.name.strip() or Path(request.folder_path).expanduser().resolve().name
+    assets: list[Asset] = []
+    for source in files:
+        try:
+            asset = _create_asset_from_source(
+                db,
+                source,
+                batch=batch,
+                copy_assets=request.copy_assets,
+                provenance={"source": "annotation_job", "annotation_level": request.annotation_level},
+            )
+            assets.append(asset)
+        except Exception as exc:
+            failed.append({"path": str(source), "reason": str(exc)})
+
     if not assets:
-        raise HTTPException(status_code=400, detail="没有可标注的素材")
+        raise HTTPException(status_code=400, detail={"message": "目录中没有可用图片", "failed": failed})
+    return assets, failed
 
+
+def create_annotation_job(db: Session, request: AnnotationJobCreateRequest) -> dict[str, Any]:
     prompt_config = resolve_job_prompt(db, request)
+    source_dir = ""
+    failed_imports: list[dict[str, str]] = []
+    if request.folder_path.strip():
+        source_dir = str(Path(request.folder_path).expanduser().resolve())
+        assets, failed_imports = _create_assets_for_job(db, request)
+    else:
+        statement = select(Asset).join(Annotation).order_by(Asset.created_at)
+        if request.asset_ids:
+            statement = statement.where(Asset.id.in_(request.asset_ids))
+        else:
+            if request.batch:
+                statement = statement.where(Asset.batch == request.batch)
+            if request.status and request.status != "all":
+                statement = statement.where(Annotation.status == request.status)
+            if not request.overwrite_existing:
+                statement = statement.where(Annotation.status.in_(["raw", "rework"]))
+
+        assets = db.scalars(statement).all()
+        source_dir = request.batch or "asset_pool"
+        if not assets:
+            raise HTTPException(status_code=400, detail="没有可标注的素材")
+
+    samples = _build_job_samples(assets, request.annotation_level, request.frame_count, source_dir)
+
     job_id = str(uuid.uuid4())
     job = AnnotationJob(
         id=job_id,
         name=request.name,
         status="queued",
-        source_json=json_dumps({"batch": request.batch, "status": request.status, "asset_ids": request.asset_ids}),
+        source_json=json_dumps(
+            {
+                "folder_path": source_dir,
+                "batch": request.batch,
+                "status": request.status,
+                "asset_ids": request.asset_ids,
+                "failed_imports": failed_imports,
+            }
+        ),
         config_json=json_dumps(
             {
                 "concurrency": request.concurrency,
                 "overwrite_existing": request.overwrite_existing,
+                "copy_assets": request.copy_assets,
+                "annotation_level": request.annotation_level,
+                "frame_count": max(1, min(request.frame_count, 10)) if request.annotation_level == "behavior" else 1,
                 **prompt_config,
             }
         ),
-        total_count=len(assets),
+        total_count=len(samples),
     )
     db.add(job)
     db.flush()
-    for asset in assets:
-        db.add(AnnotationJobItem(job_id=job_id, asset_id=asset.id, status="queued"))
+    for sample in samples:
+        db.add(AnnotationJobItem(job_id=job_id, asset_id=sample["primary_asset_id"], status="queued", sample_json=json_dumps(sample)))
     db.commit()
 
     thread = threading.Thread(target=_run_annotation_job, args=(job_id,), daemon=True)
@@ -519,17 +655,24 @@ def resolve_job_prompt(db: Session, request: AnnotationJobCreateRequest) -> dict
             "prompt_label": f"{scene.name} / {version.version}",
         }
 
-    settings = VlmSettings(**get_setting(db, "vlm", VlmSettings().model_dump()))
-    return {
-        "prompt_mode": "settings",
-        "prompt_template": settings.prompt_template,
-        "prompt_scene_id": None,
-        "prompt_version_id": None,
-        "prompt_label": "全局默认",
-    }
+    raise HTTPException(status_code=400, detail="请在标注任务中输入任务提示词，或选择一个提示词场景/版本")
 
 
-def export_annotation_job(db: Session, job_id: str, request: AnnotationJobExportRequest) -> dict[str, Any]:
+def _download_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [
+        {"role": message.get("role", ""), "content": message.get("content", "")}
+        for message in messages
+        if message.get("role") in {"user", "assistant"}
+    ]
+
+
+def export_annotation_job(
+    db: Session,
+    job_id: str,
+    request: AnnotationJobExportRequest,
+    include_images: bool = True,
+    json_array: bool = False,
+) -> dict[str, Any]:
     job = db.get(AnnotationJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="标注任务不存在")
@@ -538,13 +681,15 @@ def export_annotation_job(db: Session, job_id: str, request: AnnotationJobExport
     export_root = EXPORT_DIR / f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{safe_name}_{job.id[:8]}"
     image_dir = export_root / "images"
     export_root.mkdir(parents=True, exist_ok=True)
-    image_dir.mkdir(parents=True, exist_ok=True)
+    if include_images:
+        image_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, Any]] = []
     validation_errors: list[dict[str, Any]] = []
     for item in sorted(job.items, key=lambda row: row.id):
         asset = item.asset
         annotation = asset.annotation
+        sample = json_loads(item.sample_json, {})
         if item.status != "completed":
             continue
         if request.accepted_only and annotation.status != "accepted":
@@ -554,44 +699,86 @@ def export_annotation_job(db: Session, job_id: str, request: AnnotationJobExport
         if result["errors"]:
             validation_errors.append({"asset_id": asset.id, "errors": result["errors"]})
             continue
-        source = Path(asset.stored_path)
-        target_name = f"{asset.sha256[:16]}{source.suffix.lower()}"
-        shutil.copy2(source, image_dir / target_name)
-        rows.append(
-            {
-                "messages": messages,
-                "images": [f"images/{target_name}"],
-                "meta": {
-                    "asset_id": asset.id,
-                    "annotation_id": annotation.id,
-                    "annotation_job_id": job.id,
-                    "source": asset.original_path,
-                    "batch": asset.batch,
-                },
-            }
-        )
+
+        frames = sample.get("frames") if isinstance(sample.get("frames"), list) else []
+        if not frames:
+            frames = [_frame_payload(asset, 1)]
+        image_paths: list[str] = []
+        frame_errors: list[str] = []
+        for index, frame in enumerate(frames, start=1):
+            if not isinstance(frame, dict):
+                continue
+            source = Path(str(frame.get("stored_path") or asset.stored_path))
+            if not source.exists():
+                frame_errors.append(f"第 {index} 帧图片不存在: {source}")
+                continue
+            if include_images:
+                digest = str(frame.get("sha256") or asset.sha256)
+                target_name = f"{item.id}_{index:02d}_{digest[:16]}{source.suffix.lower()}"
+                shutil.copy2(source, image_dir / target_name)
+                image_paths.append(f"images/{target_name}")
+            else:
+                original = Path(str(frame.get("original_path") or ""))
+                image_paths.append(str(original if original.exists() else source))
+
+        if frame_errors or not image_paths:
+            validation_errors.append({"asset_id": asset.id, "job_item_id": item.id, "errors": frame_errors or ["样本图片为空"]})
+            continue
+
+        if json_array:
+            rows.append({"images": image_paths, "messages": _download_messages(messages)})
+        else:
+            rows.append(
+                {
+                    "messages": messages,
+                    "images": image_paths,
+                    "meta": {
+                        "asset_id": asset.id,
+                        "annotation_id": annotation.id,
+                        "annotation_job_id": job.id,
+                        "annotation_level": sample.get("annotation_level", "instance"),
+                        "frame_count": len(image_paths),
+                        "sample_id": sample.get("sample_id", str(item.id)),
+                        "source": asset.original_path,
+                        "sources": [frame.get("original_path") for frame in frames if isinstance(frame, dict)],
+                        "batch": asset.batch,
+                    },
+                }
+            )
 
     if not rows:
         raise HTTPException(status_code=400, detail={"message": "没有可导出的合格样本", "validation_errors": validation_errors})
 
-    data_path = export_root / "data.jsonl"
+    data_path = export_root / ("data.json" if json_array else "data.jsonl")
     with data_path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json_dumps(row) + "\n")
+        if json_array:
+            handle.write(json.dumps(rows, ensure_ascii=False, indent=2))
+        else:
+            for row in rows:
+                handle.write(json_dumps(row) + "\n")
     manifest = {
         "id": str(uuid.uuid4()),
         "annotation_job_id": job.id,
         "name": job.name,
         "created_at": datetime.utcnow().isoformat(),
-        "format": "ms-swift-jsonl-multimodal",
-        "path": "data.jsonl",
+        "format": "json-array-multimodal" if json_array else "ms-swift-jsonl-multimodal",
+        "path": data_path.name,
         "count": len(rows),
+        "annotation_level": json_loads(job.config_json, {}).get("annotation_level", "instance"),
+        "include_images": include_images,
+        "json_array": json_array,
         "validation_errors": validation_errors,
     }
     (export_root / "manifest.json").write_text(json_dumps(manifest), encoding="utf-8")
     job.export_path = str(export_root)
     db.commit()
-    return {"export_path": str(export_root), "jsonl_path": str(data_path), "count": len(rows), "validation_errors": validation_errors}
+    return {
+        "export_path": str(export_root),
+        "jsonl_path": str(data_path),
+        "json_path": str(data_path),
+        "count": len(rows),
+        "validation_errors": validation_errors,
+    }
 
 
 def export_dataset(db: Session, request: DatasetExportRequest) -> dict[str, Any]:

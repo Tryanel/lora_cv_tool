@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .database import Base, SessionLocal, engine, get_db
+from .database import Base, SessionLocal, engine, ensure_schema_compat, get_db
 from .models import Annotation, AnnotationJob, Asset, DatasetVersion, EvalRun, PromptScene, TrainingRun
 from .run_manager import build_eval_command, build_train_command, kill_run, run_payload, start_eval_run, start_train_run
 from .schemas import (
@@ -48,6 +48,7 @@ from .utils import json_dumps, json_loads
 
 
 Base.metadata.create_all(bind=engine)
+ensure_schema_compat()
 
 app = FastAPI(title="图文 SFT LoRA 标注提效工具", version="0.2.0")
 app.add_middleware(
@@ -139,6 +140,27 @@ def get_annotation_job(job_id: str, db: Session = Depends(get_db)) -> dict:
 @app.post("/annotation-jobs/{job_id}/export")
 def export_teacher_annotation_job(job_id: str, request: AnnotationJobExportRequest, db: Session = Depends(get_db)) -> dict:
     return export_annotation_job(db, job_id, request)
+
+
+@app.get("/annotation-jobs/{job_id}/export/download")
+def download_teacher_annotation_job(
+    job_id: str,
+    accepted_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    payload = export_annotation_job(
+        db,
+        job_id,
+        AnnotationJobExportRequest(accepted_only=accepted_only),
+        include_images=False,
+        json_array=True,
+    )
+    json_path = Path(payload["json_path"])
+    return FileResponse(
+        json_path,
+        media_type="application/json",
+        filename=f"{json_path.parent.name}.json",
+    )
 
 
 def _stream_annotation_job(job_id: str):
@@ -266,7 +288,7 @@ def get_dataset_manifest(dataset_id: str, db: Session = Depends(get_db)) -> dict
 def read_settings(db: Session = Depends(get_db)) -> dict:
     return {
         "swift": get_setting(db, "swift", SwiftSettings().model_dump()),
-        "vlm": get_setting(db, "vlm", VlmSettings().model_dump()),
+        "vlm": VlmSettings(**get_setting(db, "vlm", VlmSettings().model_dump())).model_dump(),
     }
 
 

@@ -80,6 +80,7 @@ class AnnotationJobItem(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     provider: Mapped[str] = mapped_column(String(160), default="")
     error: Mapped[str] = mapped_column(Text, default="")
+    sample_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, onupdate=utc_now)
 
     job: Mapped[AnnotationJob] = relationship(back_populates="items")
