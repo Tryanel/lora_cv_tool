@@ -5,6 +5,7 @@ import shutil
 import threading
 import uuid
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,8 @@ from .schemas import (
     DatasetExportRequest,
     PromptSceneCreateRequest,
     PromptVersionCreateRequest,
+    TeacherConfigUpsertRequest,
+    TeacherConnectionTestResult,
     VlmSettings,
 )
 from .utils import (
@@ -193,6 +196,183 @@ def put_setting(db: Session, key: str, value: dict[str, Any]) -> dict[str, Any]:
         db.add(setting)
     db.commit()
     return value
+
+
+def _teacher_config_store_default(db: Session) -> dict[str, Any]:
+    legacy = get_setting(db, "vlm", VlmSettings().model_dump())
+    return {
+        "active_id": "default",
+        "items": [
+            {
+                "id": "default",
+                "name": "默认 Teacher",
+                "endpoint": legacy.get("endpoint", ""),
+                "api_key": legacy.get("api_key", ""),
+                "model": legacy.get("model", ""),
+                "timeout_seconds": legacy.get("timeout_seconds", 60),
+            }
+        ],
+    }
+
+
+def _normalize_teacher_config(raw: dict[str, Any], fallback_id: str | None = None) -> dict[str, Any]:
+    config = TeacherConfigUpsertRequest(**raw)
+    config_id = str(raw.get("id") or config.id or fallback_id or uuid.uuid4().hex)
+    name = config.name.strip() or "未命名 Teacher"
+    return {
+        "id": config_id,
+        "name": name,
+        "endpoint": config.endpoint.strip(),
+        "api_key": config.api_key.strip(),
+        "model": config.model.strip(),
+        "timeout_seconds": config.timeout_seconds,
+    }
+
+
+def teacher_config_store(db: Session) -> dict[str, Any]:
+    default_store = {"active_id": "", "items": []}
+    data = get_setting(db, "teacher_configs", default_store)
+    items = []
+    changed = False
+    for raw in data.get("items", []) or []:
+        if not isinstance(raw, dict):
+            changed = True
+            continue
+        try:
+            items.append(_normalize_teacher_config(raw))
+        except Exception:
+            changed = True
+    if not items:
+        data = _teacher_config_store_default(db)
+        items = data["items"]
+        changed = True
+    active_id = str(data.get("active_id") or "")
+    if active_id not in {item["id"] for item in items}:
+        active_id = items[0]["id"] if items else ""
+        changed = True
+    store = {"active_id": active_id, "items": items}
+    if changed:
+        put_setting(db, "teacher_configs", store)
+    return store
+
+
+def active_teacher_settings(db: Session) -> VlmSettings:
+    store = teacher_config_store(db)
+    active = next((item for item in store["items"] if item["id"] == store["active_id"]), None)
+    if not active:
+        return VlmSettings()
+    return VlmSettings(**{key: active.get(key) for key in VlmSettings.model_fields})
+
+
+def save_teacher_config(db: Session, request: TeacherConfigUpsertRequest) -> dict[str, Any]:
+    store = teacher_config_store(db)
+    config_id = request.id or uuid.uuid4().hex
+    config = _normalize_teacher_config({**request.model_dump(), "id": config_id}, fallback_id=config_id)
+    replaced = False
+    items = []
+    for item in store["items"]:
+        if item["id"] == config_id:
+            items.append(config)
+            replaced = True
+        else:
+            items.append(item)
+    if not replaced:
+        items.append(config)
+    active_id = store["active_id"] or config_id
+    next_store = {"active_id": active_id, "items": items}
+    put_setting(db, "teacher_configs", next_store)
+    if active_id == config_id:
+        put_setting(db, "vlm", VlmSettings(**{key: config.get(key) for key in VlmSettings.model_fields}).model_dump())
+    return next_store
+
+
+def activate_teacher_config(db: Session, config_id: str) -> dict[str, Any]:
+    store = teacher_config_store(db)
+    active = next((item for item in store["items"] if item["id"] == config_id), None)
+    if not active:
+        raise HTTPException(status_code=404, detail="Teacher 配置不存在")
+    store["active_id"] = config_id
+    put_setting(db, "teacher_configs", store)
+    put_setting(db, "vlm", VlmSettings(**{key: active.get(key) for key in VlmSettings.model_fields}).model_dump())
+    return store
+
+
+def delete_teacher_config(db: Session, config_id: str) -> dict[str, Any]:
+    store = teacher_config_store(db)
+    items = [item for item in store["items"] if item["id"] != config_id]
+    if len(items) == len(store["items"]):
+        raise HTTPException(status_code=404, detail="Teacher 配置不存在")
+    active_id = store["active_id"]
+    if active_id == config_id:
+        active_id = items[0]["id"] if items else ""
+    next_store = {"active_id": active_id, "items": items}
+    put_setting(db, "teacher_configs", next_store)
+    if active_id:
+        active = next(item for item in items if item["id"] == active_id)
+        put_setting(db, "vlm", VlmSettings(**{key: active.get(key) for key in VlmSettings.model_fields}).model_dump())
+    else:
+        put_setting(db, "vlm", VlmSettings().model_dump())
+    return next_store
+
+
+def test_teacher_connection(request: TeacherConfigUpsertRequest) -> dict[str, Any]:
+    config = _normalize_teacher_config(request.model_dump())
+    settings = VlmSettings(**{key: config.get(key) for key in VlmSettings.model_fields})
+    if not settings.endpoint or not settings.model:
+        return TeacherConnectionTestResult(ok=False, message="请先填写 endpoint 和 model", endpoint=settings.endpoint, model=settings.model).model_dump()
+    headers = {"Content-Type": "application/json"}
+    if settings.api_key:
+        headers["Authorization"] = f"Bearer {settings.api_key}"
+    payload = {
+        "model": settings.model,
+        "messages": [{"role": "user", "content": '请只返回 {"ok": true}'}],
+        "temperature": 0,
+        "max_tokens": 32,
+    }
+    started = time.perf_counter()
+    try:
+        with httpx.Client(timeout=settings.timeout_seconds) as client:
+            response = client.post(_teacher_endpoint(settings.endpoint), json=payload, headers=headers)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        response.raise_for_status()
+        data = response.json()
+        choices = data.get("choices", [])
+        if not choices:
+            return TeacherConnectionTestResult(
+                ok=False,
+                message="接口返回成功，但没有 choices 字段",
+                status_code=response.status_code,
+                latency_ms=latency_ms,
+                endpoint=settings.endpoint,
+                model=settings.model,
+            ).model_dump()
+        return TeacherConnectionTestResult(
+            ok=True,
+            message="连接成功",
+            status_code=response.status_code,
+            latency_ms=latency_ms,
+            endpoint=settings.endpoint,
+            model=settings.model,
+        ).model_dump()
+    except httpx.HTTPStatusError as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return TeacherConnectionTestResult(
+            ok=False,
+            message=f"HTTP {exc.response.status_code}: {exc.response.text[:300]}",
+            status_code=exc.response.status_code,
+            latency_ms=latency_ms,
+            endpoint=settings.endpoint,
+            model=settings.model,
+        ).model_dump()
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return TeacherConnectionTestResult(
+            ok=False,
+            message=str(exc),
+            latency_ms=latency_ms,
+            endpoint=settings.endpoint,
+            model=settings.model,
+        ).model_dump()
 
 
 def _scan_image_files(folder_path: str) -> list[Path]:
@@ -407,7 +587,7 @@ def label_asset_with_teacher(settings: VlmSettings, asset: Asset, sample: dict[s
 
 
 async def prelabel_asset(db: Session, asset: Asset) -> dict[str, Any]:
-    settings = VlmSettings(**get_setting(db, "vlm", VlmSettings().model_dump()))
+    settings = active_teacher_settings(db)
     try:
         return label_asset_with_teacher(settings, asset)
     except Exception as exc:
@@ -468,7 +648,7 @@ def _run_annotation_job(job_id: str) -> None:
             return
         job.status = "running"
         job.started_at = datetime.utcnow()
-        settings_data = get_setting(db, "vlm", VlmSettings().model_dump())
+        settings_data = active_teacher_settings(db).model_dump()
         config = json_loads(job.config_json, {})
         settings_data["task_prompt"] = config.get("prompt_template", "")
         item_ids = [row[0] for row in db.execute(select(AnnotationJobItem.id).where(AnnotationJobItem.job_id == job_id)).all()]

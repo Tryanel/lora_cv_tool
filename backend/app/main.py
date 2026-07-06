@@ -24,16 +24,20 @@ from .schemas import (
     PromptVersionCreateRequest,
     ReworkRequest,
     SwiftSettings,
+    TeacherConfigUpsertRequest,
     TrainRequest,
     VlmSettings,
 )
 from .services import (
+    activate_teacher_config,
+    active_teacher_settings,
     annotation_job_payload,
     asset_payload,
     create_annotation_job,
     create_prompt_scene,
     create_prompt_version,
     dataset_payload,
+    delete_teacher_config,
     export_annotation_job,
     export_dataset,
     get_setting,
@@ -41,7 +45,10 @@ from .services import (
     prelabel_asset,
     prompt_scene_payload,
     put_setting,
+    save_teacher_config,
     status_counts,
+    teacher_config_store,
+    test_teacher_connection,
     validate_annotation,
 )
 from .utils import json_dumps, json_loads
@@ -286,9 +293,11 @@ def get_dataset_manifest(dataset_id: str, db: Session = Depends(get_db)) -> dict
 
 @app.get("/settings")
 def read_settings(db: Session = Depends(get_db)) -> dict:
+    teachers = teacher_config_store(db)
     return {
         "swift": get_setting(db, "swift", SwiftSettings().model_dump()),
-        "vlm": VlmSettings(**get_setting(db, "vlm", VlmSettings().model_dump())).model_dump(),
+        "vlm": active_teacher_settings(db).model_dump(),
+        "teachers": teachers,
     }
 
 
@@ -299,7 +308,57 @@ def save_swift_settings(request: SwiftSettings, db: Session = Depends(get_db)) -
 
 @app.post("/settings/vlm")
 def save_vlm_settings(request: VlmSettings, db: Session = Depends(get_db)) -> dict:
-    return put_setting(db, "vlm", request.model_dump())
+    store = teacher_config_store(db)
+    active_id = store["active_id"] or "default"
+    active = next((item for item in store["items"] if item["id"] == active_id), None)
+    name = active["name"] if active else "默认 Teacher"
+    save_teacher_config(
+        db,
+        TeacherConfigUpsertRequest(
+            id=active_id,
+            name=name,
+            endpoint=request.endpoint,
+            api_key=request.api_key,
+            model=request.model,
+            timeout_seconds=request.timeout_seconds,
+        ),
+    )
+    activate_teacher_config(db, active_id)
+    return request.model_dump()
+
+
+@app.get("/settings/teachers")
+def list_teacher_settings(db: Session = Depends(get_db)) -> dict:
+    return teacher_config_store(db)
+
+
+@app.post("/settings/teachers")
+def save_teacher_settings(request: TeacherConfigUpsertRequest, db: Session = Depends(get_db)) -> dict:
+    return save_teacher_config(db, request)
+
+
+@app.post("/settings/teachers/{config_id}/activate")
+def activate_teacher_settings(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return activate_teacher_config(db, config_id)
+
+
+@app.delete("/settings/teachers/{config_id}")
+def delete_teacher_settings(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_teacher_config(db, config_id)
+
+
+@app.post("/settings/teachers/test")
+def test_teacher_settings(request: TeacherConfigUpsertRequest) -> dict:
+    return test_teacher_connection(request)
+
+
+@app.post("/settings/teachers/{config_id}/test")
+def test_saved_teacher_settings(config_id: str, db: Session = Depends(get_db)) -> dict:
+    store = teacher_config_store(db)
+    config = next((item for item in store["items"] if item["id"] == config_id), None)
+    if not config:
+        raise HTTPException(status_code=404, detail="Teacher 配置不存在")
+    return test_teacher_connection(TeacherConfigUpsertRequest(**config))
 
 
 @app.post("/runs/train/preview")

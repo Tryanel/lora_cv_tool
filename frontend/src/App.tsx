@@ -33,13 +33,28 @@ import {
   Home,
   Image as ImageIcon,
   Play,
+  Plus,
+  Power,
   RefreshCw,
   Save,
   Search,
   Settings,
+  Trash2,
+  Wifi,
 } from 'lucide-react';
 import { api } from './api';
-import type { AnnotationJob, AnnotationJobItem, AnnotationStatus, Asset, Message, PromptScene, SettingsPayload, Validation } from './types';
+import type {
+  AnnotationJob,
+  AnnotationJobItem,
+  AnnotationStatus,
+  Asset,
+  Message,
+  PromptScene,
+  SettingsPayload,
+  TeacherConfig,
+  TeacherConnectionTestResult,
+  Validation
+} from './types';
 
 const { Header, Content } = Layout;
 const { Text, Title } = Typography;
@@ -122,7 +137,8 @@ const emptySettings: SettingsPayload = {
     api_key: '',
     model: '',
     timeout_seconds: 60
-  }
+  },
+  teachers: { active_id: '', items: [] }
 };
 
 function statusColor(status: string) {
@@ -240,38 +256,240 @@ function AnnotationCenter({
 }
 
 function SettingsView() {
-  const { message } = AntApp.useApp();
-  const [form] = Form.useForm();
+  const { message, modal } = AntApp.useApp();
+  const [form] = Form.useForm<Partial<TeacherConfig>>();
+  const [teachers, setTeachers] = useState<TeacherConfig[]>([]);
+  const [activeId, setActiveId] = useState('');
+  const [selectedId, setSelectedId] = useState('');
+  const [testResult, setTestResult] = useState<TeacherConnectionTestResult>();
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const emptyTeacher: Partial<TeacherConfig> = {
+    id: '',
+    name: '默认 Teacher',
+    endpoint: '',
+    api_key: '',
+    model: '',
+    timeout_seconds: 60
+  };
+
+  function applyStore(store: SettingsPayload['teachers'], preferredId?: string) {
+    const items = Array.isArray(store.items) ? store.items : [];
+    setTeachers(items);
+    setActiveId(store.active_id ?? '');
+    const next = items.find((item) => item.id === preferredId)
+      ?? items.find((item) => item.id === store.active_id)
+      ?? items[0];
+    if (next) {
+      setSelectedId(next.id);
+      form.setFieldsValue(next);
+    } else {
+      setSelectedId('');
+      form.setFieldsValue(emptyTeacher);
+    }
+  }
+
+  async function refresh(preferredId?: string) {
+    setLoading(true);
+    try {
+      const store = await api.listTeacherConfigs();
+      applyStore(store, preferredId);
+    } catch (error) {
+      message.error((error as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    api.getSettings()
-      .then((payload) => form.setFieldsValue(payload.vlm))
-      .catch((error) => message.error((error as Error).message));
-  }, [form, message]);
+    void refresh();
+  }, []);
 
-  async function save(values: SettingsPayload['vlm']) {
-    await api.saveVlmSettings(values);
-    message.success('Teacher 设置已保存');
+  function selectConfig(config: TeacherConfig) {
+    setSelectedId(config.id);
+    setTestResult(undefined);
+    form.setFieldsValue(config);
+  }
+
+  function createConfig() {
+    setSelectedId('');
+    setTestResult(undefined);
+    form.setFieldsValue({ ...emptyTeacher, name: `Teacher ${teachers.length + 1}` });
+  }
+
+  async function save(values: Partial<TeacherConfig>) {
+    setSaving(true);
+    try {
+      const payload = { ...values, id: selectedId || values.id || undefined };
+      const store = await api.saveTeacherConfig(payload);
+      const nextId = payload.id || store.items[store.items.length - 1]?.id;
+      applyStore(store, nextId);
+      message.success('Teacher 配置已保存');
+    } catch (error) {
+      message.error((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function activateCurrent() {
+    if (!selectedId) {
+      message.warning('请先保存当前配置');
+      return;
+    }
+    try {
+      const store = await api.activateTeacherConfig(selectedId);
+      applyStore(store, selectedId);
+      message.success('已设为启用配置');
+    } catch (error) {
+      message.error((error as Error).message);
+    }
+  }
+
+  async function activateConfig(configId: string) {
+    try {
+      const store = await api.activateTeacherConfig(configId);
+      applyStore(store, configId);
+      message.success('已设为启用配置');
+    } catch (error) {
+      message.error((error as Error).message);
+    }
+  }
+
+  async function testCurrent() {
+    try {
+      const result = await api.testTeacherConfig({ ...form.getFieldsValue(), id: selectedId || undefined });
+      setTestResult(result);
+      if (result.ok) {
+        message.success('Teacher 连接正常');
+      } else {
+        message.warning(result.message);
+      }
+    } catch (error) {
+      message.error((error as Error).message);
+    }
+  }
+
+  function deleteConfig(config: TeacherConfig) {
+    modal.confirm({
+      title: `删除 ${config.name}？`,
+      content: activeId === config.id ? '当前配置正在启用，删除后会自动切换到列表中的其它配置。' : '删除后不可恢复。',
+      okText: '删除',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        const store = await api.deleteTeacherConfig(config.id);
+        applyStore(store);
+        message.success('已删除配置');
+      }
+    });
   }
 
   return (
-    <div className="single-panel">
-      <Title level={4}>Teacher</Title>
-      <Form form={form} layout="vertical" initialValues={emptySettings.vlm} onFinish={save}>
-        <Form.Item name="endpoint" label="内网 endpoint">
-          <Input placeholder="http://teacher.internal/v1" />
-        </Form.Item>
-        <Form.Item name="api_key" label="API Key">
-          <Input.Password placeholder="sk-..." />
-        </Form.Item>
-        <Form.Item name="model" label="model">
-          <Input placeholder="Qwen2.5-VL-72B-Instruct" />
-        </Form.Item>
-        <Form.Item name="timeout_seconds" label="超时">
-          <InputNumber min={1} max={600} />
-        </Form.Item>
-        <Button type="primary" htmlType="submit" icon={<Save size={16} />}>保存</Button>
-      </Form>
+    <div className="single-panel teacher-settings-panel">
+      <div className="panel-title-row">
+        <Title level={4}>Teacher 配置</Title>
+        <Button icon={<RefreshCw size={16} />} onClick={() => refresh(selectedId)}>刷新</Button>
+      </div>
+      <div className="teacher-settings-grid">
+        <section className="teacher-list-panel">
+          <div className="panel-title-row">
+            <Text strong>配置列表</Text>
+            <Button size="small" icon={<Plus size={14} />} onClick={createConfig}>新建</Button>
+          </div>
+          <Spin spinning={loading}>
+            <List
+              dataSource={teachers}
+              locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无配置" /> }}
+              renderItem={(config) => (
+                <List.Item className="teacher-list-item">
+                  <div
+                    className={`teacher-config-row ${selectedId === config.id ? 'selected' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => selectConfig(config)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') selectConfig(config);
+                    }}
+                  >
+                    <div className="teacher-config-main">
+                      <Space size={6}>
+                        <Text strong ellipsis>{config.name}</Text>
+                        {activeId === config.id && <Tag color="green">启用中</Tag>}
+                      </Space>
+                      <Text type="secondary" ellipsis>{config.model || '未填写 model'}</Text>
+                    </div>
+                    <Space>
+                      <Tooltip title="设为启用">
+                        <Button
+                          size="small"
+                          icon={<Power size={14} />}
+                          disabled={activeId === config.id}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void activateConfig(config.id);
+                          }}
+                        />
+                      </Tooltip>
+                      <Tooltip title="删除">
+                        <Button
+                          size="small"
+                          danger
+                          icon={<Trash2 size={14} />}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteConfig(config);
+                          }}
+                        />
+                      </Tooltip>
+                    </Space>
+                  </div>
+                </List.Item>
+              )}
+            />
+          </Spin>
+        </section>
+
+        <section className="teacher-editor-panel">
+          <Form form={form} layout="vertical" initialValues={emptyTeacher} onFinish={save}>
+            <Form.Item name="id" hidden><Input /></Form.Item>
+            <Form.Item name="name" label="配置名称" rules={[{ required: true, message: '请输入配置名称' }]}>
+              <Input placeholder="例如：内网 Qwen-VL Teacher" />
+            </Form.Item>
+            <Form.Item name="endpoint" label="内网 endpoint">
+              <Input placeholder="http://teacher.internal/v1" />
+            </Form.Item>
+            <Form.Item name="api_key" label="API Key">
+              <Input.Password placeholder="sk-..." />
+            </Form.Item>
+            <Form.Item name="model" label="model">
+              <Input placeholder="Qwen2.5-VL-72B-Instruct" />
+            </Form.Item>
+            <Form.Item name="timeout_seconds" label="超时（秒）">
+              <InputNumber min={1} max={600} />
+            </Form.Item>
+            <Space wrap>
+              <Button type="primary" htmlType="submit" loading={saving} icon={<Save size={16} />}>保存配置</Button>
+              <Button icon={<Wifi size={16} />} onClick={testCurrent}>检测连接</Button>
+              <Button icon={<Power size={16} />} disabled={!selectedId || activeId === selectedId} onClick={activateCurrent}>设为启用</Button>
+            </Space>
+          </Form>
+          {testResult && (
+            <Alert
+              className="teacher-test-result"
+              type={testResult.ok ? 'success' : 'warning'}
+              showIcon
+              message={testResult.message}
+              description={[
+                testResult.status_code ? `HTTP ${testResult.status_code}` : '',
+                testResult.latency_ms != null ? `${testResult.latency_ms} ms` : '',
+                testResult.model ? `model: ${testResult.model}` : ''
+              ].filter(Boolean).join(' · ')}
+            />
+          )}
+        </section>
+      </div>
     </div>
   );
 }

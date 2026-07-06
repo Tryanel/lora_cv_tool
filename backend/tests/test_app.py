@@ -26,6 +26,31 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     response = client.get("/settings")
     assert response.status_code == 200
     assert "prompt_template" not in response.json()["vlm"]
+    assert response.json()["teachers"]["active_id"]
+
+    response = client.post(
+        "/settings/teachers",
+        json={"name": "teacher_a", "endpoint": "", "api_key": "key-a", "model": "", "timeout_seconds": 5},
+    )
+    assert response.status_code == 200
+    teacher_a = response.json()["items"][-1]
+    response = client.post(
+        "/settings/teachers",
+        json={"name": "teacher_b", "endpoint": "", "api_key": "key-b", "model": "", "timeout_seconds": 6},
+    )
+    assert response.status_code == 200
+    teacher_b = response.json()["items"][-1]
+    assert teacher_a["id"] != teacher_b["id"]
+
+    response = client.post(f"/settings/teachers/{teacher_b['id']}/activate")
+    assert response.status_code == 200
+    assert response.json()["active_id"] == teacher_b["id"]
+    response = client.get("/settings")
+    assert response.json()["vlm"]["timeout_seconds"] == 6
+
+    response = client.post("/settings/teachers/test", json={"name": "draft", "endpoint": "", "model": "", "api_key": "", "timeout_seconds": 5})
+    assert response.status_code == 200
+    assert response.json()["ok"] is False
 
     response = client.post(
         "/annotation-jobs",

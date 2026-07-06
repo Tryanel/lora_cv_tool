@@ -553,6 +553,59 @@ button {
   gap: 12px;
 }
 
+.teacher-settings-panel {
+  max-width: 1120px;
+}
+
+.teacher-settings-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 360px) minmax(360px, 1fr);
+  gap: 12px;
+}
+
+.teacher-list-panel,
+.teacher-editor-panel {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid #dde3ed;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.teacher-list-item {
+  padding: 6px 0 !important;
+}
+
+.teacher-config-row {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #dde3ed;
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.teacher-config-row:hover,
+.teacher-config-row.selected {
+  border-color: #93c5fd;
+  background: #eff6ff;
+}
+
+.teacher-config-main {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.teacher-test-result {
+  margin-top: 14px;
+}
+
 .panel-title-row {
   display: flex;
   align-items: center;
@@ -621,6 +674,7 @@ button {
 
   .ops-grid,
   .settings-grid,
+  .teacher-settings-grid,
   .jobs-grid,
   .prompt-grid,
   .feature-grid {

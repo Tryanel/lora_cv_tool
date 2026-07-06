@@ -8,6 +8,9 @@ import type {
   PromptVersion,
   RunRecord,
   SettingsPayload,
+  TeacherConfig,
+  TeacherConfigStore,
+  TeacherConnectionTestResult,
   Validation
 } from './types';
 
@@ -168,6 +171,24 @@ export const api = {
   },
   saveVlmSettings(payload: SettingsPayload['vlm']) {
     return request<SettingsPayload['vlm']>('/settings/vlm', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  listTeacherConfigs() {
+    return request<TeacherConfigStore>('/settings/teachers');
+  },
+  saveTeacherConfig(payload: Partial<TeacherConfig>) {
+    return request<TeacherConfigStore>('/settings/teachers', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  activateTeacherConfig(configId: string) {
+    return request<TeacherConfigStore>(`/settings/teachers/${configId}/activate`, { method: 'POST' });
+  },
+  deleteTeacherConfig(configId: string) {
+    return request<TeacherConfigStore>(`/settings/teachers/${configId}`, { method: 'DELETE' });
+  },
+  testTeacherConfig(payload: Partial<TeacherConfig>) {
+    return request<TeacherConnectionTestResult>('/settings/teachers/test', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  testSavedTeacherConfig(configId: string) {
+    return request<TeacherConnectionTestResult>(`/settings/teachers/${configId}/test`, { method: 'POST' });
   },
   trainPreview(payload: Record<string, unknown>) {
     return request<{ command: string[]; env: Record<string, string>; output_dir: string }>('/runs/train/preview', {

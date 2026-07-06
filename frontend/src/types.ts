@@ -138,6 +138,29 @@ export interface RunRecord {
   samples?: unknown[];
 }
 
+export interface TeacherConfig {
+  id: string;
+  name: string;
+  endpoint: string;
+  api_key: string;
+  model: string;
+  timeout_seconds: number;
+}
+
+export interface TeacherConfigStore {
+  active_id: string;
+  items: TeacherConfig[];
+}
+
+export interface TeacherConnectionTestResult {
+  ok: boolean;
+  message: string;
+  status_code?: number | null;
+  latency_ms?: number | null;
+  endpoint: string;
+  model: string;
+}
+
 export interface SettingsPayload {
   swift: {
     swift_bin: string;
@@ -150,4 +173,5 @@ export interface SettingsPayload {
     model: string;
     timeout_seconds: number;
   };
+  teachers: TeacherConfigStore;
 }

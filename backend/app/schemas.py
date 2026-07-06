@@ -84,7 +84,26 @@ class VlmSettings(BaseModel):
     endpoint: str = ""
     api_key: str = ""
     model: str = ""
-    timeout_seconds: int = 60
+    timeout_seconds: int = Field(default=60, ge=1, le=600)
+
+
+class TeacherConfig(VlmSettings):
+    id: str = ""
+    name: str = "默认 Teacher"
+
+
+class TeacherConfigUpsertRequest(VlmSettings):
+    id: Optional[str] = None
+    name: str = "默认 Teacher"
+
+
+class TeacherConnectionTestResult(BaseModel):
+    ok: bool
+    message: str
+    status_code: Optional[int] = None
+    latency_ms: Optional[int] = None
+    endpoint: str = ""
+    model: str = ""
 
 
 class TrainRequest(BaseModel):
