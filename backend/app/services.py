@@ -23,6 +23,7 @@ from .schemas import (
     AnnotationJobExportRequest,
     DatasetExportRequest,
     PromptSceneCreateRequest,
+    PromptSceneUpdateRequest,
     PromptVersionCreateRequest,
     TeacherConfigUpsertRequest,
     TeacherConnectionTestResult,
@@ -138,6 +139,7 @@ def prompt_scene_payload(scene: PromptScene, include_versions: bool = True) -> d
     payload = {
         "id": scene.id,
         "name": scene.name,
+        "annotation_level": scene.annotation_level,
         "description": scene.description,
         "created_at": scene.created_at.isoformat(),
         "updated_at": scene.updated_at.isoformat(),
@@ -151,11 +153,41 @@ def create_prompt_scene(db: Session, request: PromptSceneCreateRequest) -> dict[
     name = request.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="场景名称不能为空")
-    existing = db.scalar(select(PromptScene).where(PromptScene.name == name))
+    existing = db.scalar(
+        select(PromptScene).where(
+            PromptScene.name == name,
+            PromptScene.annotation_level == request.annotation_level,
+        )
+    )
     if existing:
-        raise HTTPException(status_code=400, detail="场景名称已存在")
-    scene = PromptScene(name=name, description=request.description)
+        raise HTTPException(status_code=400, detail="同一标注等级下的场景名称已存在")
+    scene = PromptScene(name=name, annotation_level=request.annotation_level, description=request.description)
     db.add(scene)
+    db.commit()
+    db.refresh(scene)
+    return prompt_scene_payload(scene)
+
+
+def update_prompt_scene(db: Session, scene_id: int, request: PromptSceneUpdateRequest) -> dict[str, Any]:
+    scene = db.get(PromptScene, scene_id)
+    if not scene:
+        raise HTTPException(status_code=404, detail="提示词场景不存在")
+    name = request.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="场景名称不能为空")
+    existing = db.scalar(
+        select(PromptScene).where(
+            PromptScene.name == name,
+            PromptScene.annotation_level == request.annotation_level,
+            PromptScene.id != scene_id,
+        )
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="同一标注等级下的场景名称已存在")
+    scene.name = name
+    scene.annotation_level = request.annotation_level
+    scene.description = request.description
+    scene.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(scene)
     return prompt_scene_payload(scene)
@@ -176,6 +208,15 @@ def create_prompt_version(db: Session, request: PromptVersionCreateRequest) -> d
     db.commit()
     db.refresh(prompt_version)
     return prompt_version_payload(prompt_version)
+
+
+def delete_prompt_scene(db: Session, scene_id: int) -> dict[str, Any]:
+    scene = db.get(PromptScene, scene_id)
+    if not scene:
+        raise HTTPException(status_code=404, detail="提示词场景不存在")
+    db.delete(scene)
+    db.commit()
+    return {"deleted": True, "id": scene_id}
 
 
 def get_setting(db: Session, key: str, default: dict[str, Any]) -> dict[str, Any]:
@@ -605,16 +646,99 @@ def _refresh_job_counts(db: Session, job_id: str) -> None:
     ).all()
     counts = {status: count for status, count in rows}
     job.completed_count = counts.get("completed", 0)
-    job.failed_count = counts.get("failed", 0)
+    job.failed_count = counts.get("failed", 0) + counts.get("cancelled", 0)
+    if job.status == "cancelled":
+        if job.finished_at is None:
+            job.finished_at = datetime.utcnow()
+        return
     if job.completed_count + job.failed_count >= job.total_count and job.status not in {"cancelled", "failed"}:
         job.status = "completed" if job.failed_count == 0 else "completed_with_errors"
         job.finished_at = datetime.utcnow()
+
+
+def cancel_annotation_job(db: Session, job_id: str) -> dict[str, Any]:
+    job = db.get(AnnotationJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="标注任务不存在")
+    if job.status in {"completed", "completed_with_errors", "failed", "cancelled"}:
+        return annotation_job_payload(job, include_items=True)
+
+    job.status = "cancelled"
+    job.error = "任务已取消"
+    job.finished_at = datetime.utcnow()
+    queued_items = db.scalars(
+        select(AnnotationJobItem)
+        .where(AnnotationJobItem.job_id == job_id)
+        .where(AnnotationJobItem.status.in_(["queued", "running"]))
+    ).all()
+    for item in queued_items:
+        item.status = "cancelled"
+        item.error = "任务已取消"
+    _refresh_job_counts(db, job_id)
+    db.commit()
+    db.refresh(job)
+    return annotation_job_payload(job, include_items=True)
+
+
+def pause_annotation_job(db: Session, job_id: str) -> dict[str, Any]:
+    job = db.get(AnnotationJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="标注任务不存在")
+    if job.status not in {"queued", "running"}:
+        return annotation_job_payload(job, include_items=True)
+
+    job.status = "paused"
+    job.error = "任务已暂停"
+    _refresh_job_counts(db, job_id)
+    db.commit()
+    db.refresh(job)
+    return annotation_job_payload(job, include_items=True)
+
+
+def resume_annotation_job(db: Session, job_id: str) -> dict[str, Any]:
+    job = db.get(AnnotationJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="标注任务不存在")
+    if job.status != "paused":
+        return annotation_job_payload(job, include_items=True)
+
+    queued_count = db.scalar(
+        select(func.count(AnnotationJobItem.id))
+        .where(AnnotationJobItem.job_id == job_id)
+        .where(AnnotationJobItem.status == "queued")
+    ) or 0
+    if queued_count <= 0:
+        _refresh_job_counts(db, job_id)
+        db.commit()
+        db.refresh(job)
+        return annotation_job_payload(job, include_items=True)
+
+    job.status = "queued"
+    job.error = ""
+    job.finished_at = None
+    db.commit()
+    thread = threading.Thread(target=_run_annotation_job, args=(job_id,), daemon=True)
+    thread.start()
+    db.refresh(job)
+    return annotation_job_payload(job, include_items=True)
 
 
 def _process_job_item(item_id: int, settings_data: dict[str, Any]) -> None:
     with SessionLocal() as db:
         item = db.get(AnnotationJobItem, item_id)
         if not item:
+            return
+        if item.status != "queued":
+            return
+        if item.status == "cancelled" or item.job.status == "cancelled":
+            item.status = "cancelled"
+            item.error = "任务已取消"
+            _refresh_job_counts(db, item.job_id)
+            db.commit()
+            return
+        if item.job.status == "paused":
+            item.error = "任务已暂停"
+            db.commit()
             return
         item.status = "running"
         db.commit()
@@ -625,6 +749,14 @@ def _process_job_item(item_id: int, settings_data: dict[str, Any]) -> None:
         task_prompt = str(settings_data.get("task_prompt", ""))
         try:
             suggestion = label_asset_with_teacher(settings, asset, sample, task_prompt=task_prompt)
+            db.refresh(item)
+            db.refresh(item.job)
+            if item.job.status == "cancelled":
+                item.status = "cancelled"
+                item.error = "任务已取消"
+                _refresh_job_counts(db, item.job_id)
+                db.commit()
+                return
             annotation = asset.annotation
             annotation.messages_json = json_dumps(suggestion["messages"])
             annotation.status = "prelabelled"
@@ -635,8 +767,13 @@ def _process_job_item(item_id: int, settings_data: dict[str, Any]) -> None:
             item.provider = suggestion["provider"]
             item.error = ""
         except Exception as exc:
-            item.status = "failed"
-            item.error = str(exc)
+            db.refresh(item.job)
+            if item.job.status == "cancelled":
+                item.status = "cancelled"
+                item.error = "任务已取消"
+            else:
+                item.status = "failed"
+                item.error = str(exc)
         _refresh_job_counts(db, item.job_id)
         db.commit()
 
@@ -646,12 +783,28 @@ def _run_annotation_job(job_id: str) -> None:
         job = db.get(AnnotationJob, job_id)
         if not job:
             return
+        if job.status == "cancelled":
+            _refresh_job_counts(db, job_id)
+            db.commit()
+            return
+        if job.status == "paused":
+            _refresh_job_counts(db, job_id)
+            db.commit()
+            return
         job.status = "running"
-        job.started_at = datetime.utcnow()
+        if job.started_at is None:
+            job.started_at = datetime.utcnow()
         settings_data = active_teacher_settings(db).model_dump()
         config = json_loads(job.config_json, {})
         settings_data["task_prompt"] = config.get("prompt_template", "")
-        item_ids = [row[0] for row in db.execute(select(AnnotationJobItem.id).where(AnnotationJobItem.job_id == job_id)).all()]
+        item_ids = [
+            row[0]
+            for row in db.execute(
+                select(AnnotationJobItem.id)
+                .where(AnnotationJobItem.job_id == job_id)
+                .where(AnnotationJobItem.status == "queued")
+            ).all()
+        ]
         db.commit()
 
     concurrency = max(1, min(int(config.get("concurrency", 3)), 16))
@@ -799,11 +952,26 @@ def create_annotation_job(db: Session, request: AnnotationJobCreateRequest) -> d
 def resolve_job_prompt(db: Session, request: AnnotationJobCreateRequest) -> dict[str, Any]:
     custom_prompt = request.custom_prompt.strip()
     if custom_prompt:
+        if request.prompt_version_id:
+            version = db.get(PromptVersion, request.prompt_version_id)
+            if not version:
+                raise HTTPException(status_code=404, detail="提示词版本不存在")
+            if request.prompt_scene_id and version.scene_id != request.prompt_scene_id:
+                raise HTTPException(status_code=400, detail="提示词版本不属于所选场景")
+            if version.scene.annotation_level != request.annotation_level:
+                raise HTTPException(status_code=400, detail="提示词场景等级与标注任务等级不一致")
+        elif request.prompt_scene_id:
+            scene = db.get(PromptScene, request.prompt_scene_id)
+            if not scene:
+                raise HTTPException(status_code=404, detail="提示词场景不存在")
+            if scene.annotation_level != request.annotation_level:
+                raise HTTPException(status_code=400, detail="提示词场景等级与标注任务等级不一致")
         return {
             "prompt_mode": "custom",
             "prompt_template": custom_prompt,
             "prompt_scene_id": request.prompt_scene_id,
             "prompt_version_id": request.prompt_version_id,
+            "prompt_annotation_level": request.annotation_level,
             "prompt_label": "临时录入",
         }
 
@@ -814,7 +982,14 @@ def resolve_job_prompt(db: Session, request: AnnotationJobCreateRequest) -> dict
             raise HTTPException(status_code=404, detail="提示词版本不存在")
         if request.prompt_scene_id and version.scene_id != request.prompt_scene_id:
             raise HTTPException(status_code=400, detail="提示词版本不属于所选场景")
+        if version.scene.annotation_level != request.annotation_level:
+            raise HTTPException(status_code=400, detail="提示词场景等级与标注任务等级不一致")
     elif request.prompt_scene_id:
+        scene = db.get(PromptScene, request.prompt_scene_id)
+        if not scene:
+            raise HTTPException(status_code=404, detail="提示词场景不存在")
+        if scene.annotation_level != request.annotation_level:
+            raise HTTPException(status_code=400, detail="提示词场景等级与标注任务等级不一致")
         version = db.scalar(
             select(PromptVersion)
             .where(PromptVersion.scene_id == request.prompt_scene_id)
@@ -825,14 +1000,16 @@ def resolve_job_prompt(db: Session, request: AnnotationJobCreateRequest) -> dict
 
     if version:
         scene = version.scene
+        level_label = "行为级" if scene.annotation_level == "behavior" else "实例级"
         return {
             "prompt_mode": "version",
             "prompt_template": version.prompt_text,
             "prompt_scene_id": scene.id,
             "prompt_scene_name": scene.name,
+            "prompt_annotation_level": scene.annotation_level,
             "prompt_version_id": version.id,
             "prompt_version": version.version,
-            "prompt_label": f"{scene.name} / {version.version}",
+            "prompt_label": f"{scene.name} / {level_label} / {version.version}",
         }
 
     raise HTTPException(status_code=400, detail="请在标注任务中输入任务提示词，或选择一个提示词场景/版本")

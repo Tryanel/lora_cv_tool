@@ -21,6 +21,7 @@ from .schemas import (
     EvalRequest,
     ImportRequest,
     PromptSceneCreateRequest,
+    PromptSceneUpdateRequest,
     PromptVersionCreateRequest,
     ReworkRequest,
     SwiftSettings,
@@ -33,22 +34,27 @@ from .services import (
     active_teacher_settings,
     annotation_job_payload,
     asset_payload,
+    cancel_annotation_job,
     create_annotation_job,
     create_prompt_scene,
     create_prompt_version,
     dataset_payload,
+    delete_prompt_scene,
     delete_teacher_config,
     export_annotation_job,
     export_dataset,
     get_setting,
     import_folder,
+    pause_annotation_job,
     prelabel_asset,
     prompt_scene_payload,
     put_setting,
+    resume_annotation_job,
     save_teacher_config,
     status_counts,
     teacher_config_store,
     test_teacher_connection,
+    update_prompt_scene,
     validate_annotation,
 )
 from .utils import json_dumps, json_loads
@@ -120,6 +126,16 @@ def list_scenes(db: Session = Depends(get_db)) -> dict:
     return {"items": [prompt_scene_payload(scene) for scene in scenes]}
 
 
+@app.put("/prompt-scenes/{scene_id}")
+def update_scene(scene_id: int, request: PromptSceneUpdateRequest, db: Session = Depends(get_db)) -> dict:
+    return update_prompt_scene(db, scene_id, request)
+
+
+@app.delete("/prompt-scenes/{scene_id}")
+def delete_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
+    return delete_prompt_scene(db, scene_id)
+
+
 @app.post("/prompt-versions")
 def create_version(request: PromptVersionCreateRequest, db: Session = Depends(get_db)) -> dict:
     return create_prompt_version(db, request)
@@ -142,6 +158,21 @@ def get_annotation_job(job_id: str, db: Session = Depends(get_db)) -> dict:
     if not job:
         raise HTTPException(status_code=404, detail="标注任务不存在")
     return annotation_job_payload(job, include_items=True)
+
+
+@app.post("/annotation-jobs/{job_id}/cancel")
+def cancel_teacher_annotation_job(job_id: str, db: Session = Depends(get_db)) -> dict:
+    return cancel_annotation_job(db, job_id)
+
+
+@app.post("/annotation-jobs/{job_id}/pause")
+def pause_teacher_annotation_job(job_id: str, db: Session = Depends(get_db)) -> dict:
+    return pause_annotation_job(db, job_id)
+
+
+@app.post("/annotation-jobs/{job_id}/resume")
+def resume_teacher_annotation_job(job_id: str, db: Session = Depends(get_db)) -> dict:
+    return resume_annotation_job(db, job_id)
 
 
 @app.post("/annotation-jobs/{job_id}/export")

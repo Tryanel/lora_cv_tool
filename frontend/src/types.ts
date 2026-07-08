@@ -1,5 +1,6 @@
 export type AnnotationStatus = 'raw' | 'prelabelled' | 'annotated' | 'accepted' | 'rework';
 export type MessageRole = 'system' | 'user' | 'assistant';
+export type AnnotationLevel = 'instance' | 'behavior';
 
 export interface Message {
   role: MessageRole;
@@ -55,7 +56,7 @@ export interface AnnotationSampleFrame {
 
 export interface AnnotationSample {
   sample_id?: string;
-  annotation_level?: 'instance' | 'behavior';
+  annotation_level?: AnnotationLevel;
   frame_count?: number;
   source_dir?: string;
   primary_asset_id?: number;
@@ -66,7 +67,7 @@ export interface AnnotationJobItem {
   id: number;
   job_id: string;
   asset_id: number;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
   provider: string;
   error: string;
   sample: AnnotationSample;
@@ -77,7 +78,7 @@ export interface AnnotationJobItem {
 export interface AnnotationJob {
   id: string;
   name: string;
-  status: 'queued' | 'running' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'paused' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled';
   source: Record<string, unknown>;
   config: Record<string, unknown>;
   total_count: number;
@@ -103,6 +104,7 @@ export interface PromptVersion {
 export interface PromptScene {
   id: number;
   name: string;
+  annotation_level: AnnotationLevel;
   description: string;
   created_at: string;
   updated_at: string;

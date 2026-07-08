@@ -315,7 +315,25 @@ server {
 3. 进入 `标注任务`，填写本地图片目录，选择实例级或行为级。
 4. 启动任务，Teacher 会按任务提示词生成 `user/assistant` 标注。
 5. 进入 `人工审核`，检查图片、多帧行为、messages 内容，保存、通过或返修。
-6. 点击 `导出`，浏览器会下载 `.json` 文件到默认下载目录。
+6. 在 `标注任务` 列表的任务行内点击 `导出`，浏览器会下载 `.json` 文件到默认下载目录。
+
+## 自动化验收
+
+后端和前端开发服务启动后，可以运行 UI smoke 脚本模拟主要功能点击并截图：
+
+```powershell
+$env:APP_URL = "http://127.0.0.1:5173"
+$env:API_BASE = "http://127.0.0.1:8000"
+node scripts\ui_smoke.mjs
+```
+
+Linux / macOS：
+
+```bash
+APP_URL=http://127.0.0.1:5173 API_BASE=http://127.0.0.1:8000 node scripts/ui_smoke.mjs
+```
+
+脚本会访问首页、标注任务、人工审核、提示词库、Teacher 配置，验证侧边栏隐藏/悬停/固定，并把截图保存到 `logs/ui-smoke/<timestamp>/`。
 
 ## Teacher 接口要求
 

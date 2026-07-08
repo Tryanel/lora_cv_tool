@@ -15,6 +15,8 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     monkeypatch.setenv("LORA_TOOL_DATA", str(tmp_path / "data"))
 
     from app.main import app
+    from app.database import SessionLocal
+    from app.models import AnnotationJob
 
     image_dir = tmp_path / "images"
     image_dir.mkdir()
@@ -27,6 +29,20 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     assert response.status_code == 200
     assert "prompt_template" not in response.json()["vlm"]
     assert response.json()["teachers"]["active_id"]
+
+    with SessionLocal() as db:
+        db.add(AnnotationJob(id="cancel-test-job", name="cancel_me", status="queued", source_json="{}", config_json="{}", total_count=0))
+        db.commit()
+    response = client.post("/annotation-jobs/cancel-test-job/cancel")
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+
+    with SessionLocal() as db:
+        db.add(AnnotationJob(id="pause-test-job", name="pause_me", status="queued", source_json="{}", config_json="{}", total_count=1))
+        db.commit()
+    response = client.post("/annotation-jobs/pause-test-job/pause")
+    assert response.status_code == 200
+    assert response.json()["status"] == "paused"
 
     response = client.post(
         "/settings/teachers",
@@ -64,9 +80,37 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     assert response.status_code == 400
     assert "提示词" in response.json()["detail"]
 
-    response = client.post("/prompt-scenes", json={"name": "cot_scene", "description": "produce cot annotations"})
+    response = client.post(
+        "/prompt-scenes",
+        json={"name": "cot_scene", "annotation_level": "behavior", "description": "produce cot annotations"},
+    )
     assert response.status_code == 200
     scene_id = response.json()["id"]
+    assert response.json()["annotation_level"] == "behavior"
+
+    response = client.post(
+        "/prompt-scenes",
+        json={"name": "cot_scene", "annotation_level": "instance", "description": "same name for instance"},
+    )
+    assert response.status_code == 200
+    instance_scene_id = response.json()["id"]
+
+    response = client.post(
+        "/prompt-scenes",
+        json={"name": "cot_scene", "annotation_level": "behavior", "description": "duplicate"},
+    )
+    assert response.status_code == 400
+
+    response = client.post(
+        "/prompt-scenes",
+        json={"name": "cleanup_scene", "annotation_level": "behavior", "description": "temporary"},
+    )
+    assert response.status_code == 200
+    cleanup_scene_id = response.json()["id"]
+    response = client.delete(f"/prompt-scenes/{cleanup_scene_id}")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+
     response = client.post(
         "/prompt-versions",
         json={
@@ -78,6 +122,21 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     )
     assert response.status_code == 200
     prompt_version_id = response.json()["id"]
+
+    response = client.post(
+        "/annotation-jobs",
+        json={
+            "name": "level_mismatch",
+            "folder_path": str(image_dir),
+            "annotation_level": "behavior",
+            "frame_count": 2,
+            "concurrency": 1,
+            "prompt_scene_id": instance_scene_id,
+            "custom_prompt": "临时提示词也不能混用其他等级的提示词场景。",
+        },
+    )
+    assert response.status_code == 400
+    assert "等级" in response.json()["detail"]
 
     response = client.post(
         "/annotation-jobs",
@@ -96,8 +155,9 @@ def test_directory_annotation_job_and_behavior_swift_json_export(tmp_path: Path,
     job_id = response.json()["id"]
     assert response.json()["config"]["prompt_scene_id"] == scene_id
     assert response.json()["config"]["prompt_version_id"] == prompt_version_id
-    assert response.json()["config"]["prompt_label"] == "cot_scene / v1"
+    assert response.json()["config"]["prompt_label"] == "cot_scene / 行为级 / v1"
     assert response.json()["config"]["annotation_level"] == "behavior"
+    assert response.json()["config"]["prompt_annotation_level"] == "behavior"
     assert response.json()["total_count"] == 2
 
     job = None

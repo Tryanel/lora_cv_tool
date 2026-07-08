@@ -43,6 +43,13 @@ class AnnotationJobExportRequest(BaseModel):
 
 class PromptSceneCreateRequest(BaseModel):
     name: str
+    annotation_level: AnnotationLevel = "instance"
+    description: str = ""
+
+
+class PromptSceneUpdateRequest(BaseModel):
+    name: str
+    annotation_level: AnnotationLevel = "instance"
     description: str = ""
 
 

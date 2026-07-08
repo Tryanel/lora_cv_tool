@@ -115,8 +115,11 @@ export const api = {
   prelabel(assetId: number) {
     return request<{ asset: Asset; suggestion: unknown; validation: Validation }>(`/annotations/${assetId}/prelabel`, { method: 'POST' });
   },
-  createPromptScene(payload: { name: string; description: string }) {
+  createPromptScene(payload: { name: string; annotation_level: 'instance' | 'behavior'; description: string }) {
     return request<PromptScene>('/prompt-scenes', { method: 'POST', body: JSON.stringify(payload) });
+  },
+  updatePromptScene(sceneId: number, payload: { name: string; annotation_level: 'instance' | 'behavior'; description: string }) {
+    return request<PromptScene>(`/prompt-scenes/${sceneId}`, { method: 'PUT', body: JSON.stringify(payload) });
   },
   listPromptScenes() {
     return request<{ items: PromptScene[] }>('/prompt-scenes');
@@ -146,6 +149,15 @@ export const api = {
   },
   getAnnotationJob(jobId: string) {
     return request<AnnotationJob>(`/annotation-jobs/${jobId}`);
+  },
+  cancelAnnotationJob(jobId: string) {
+    return request<AnnotationJob>(`/annotation-jobs/${jobId}/cancel`, { method: 'POST' });
+  },
+  pauseAnnotationJob(jobId: string) {
+    return request<AnnotationJob>(`/annotation-jobs/${jobId}/pause`, { method: 'POST' });
+  },
+  resumeAnnotationJob(jobId: string) {
+    return request<AnnotationJob>(`/annotation-jobs/${jobId}/resume`, { method: 'POST' });
   },
   exportAnnotationJob(jobId: string, payload: { accepted_only: boolean }) {
     return request<{ export_path: string; jsonl_path: string; count: number; validation_errors: unknown[] }>(`/annotation-jobs/${jobId}/export`, {
